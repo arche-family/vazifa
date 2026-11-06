@@ -1,0 +1,386 @@
+/// What the user sees: a list of tasks, in one of its forms, and the numbers.
+import alloc;
+import board;
+import cli;
+import core.utf8;
+import date;
+import std;
+import std.testing as std_testing;
+
+// ---- which tasks --------------------------------------------------------------------
+
+fn lower_ascii(c: u8) -> u8 {
+    if c >= 'A' and c <= 'Z' {
+        return c - 'A' + 'a';
+    }
+    return c;
+}
+
+/// Whether text is in hay, whatever the case of its ASCII letters.
+pub fn contains_text(hay: str, text: str) -> bool {
+    let h = hay.bytes();
+    let n = text.bytes();
+    if n.len() == 0 {
+        return true;
+    }
+    var at: usize = 0;
+    while at + n.len() <= h.len() : (at += 1) {
+        var k: usize = 0;
+        while k < n.len() and lower_ascii(h[at + k]) == lower_ascii(n[k]) : (k += 1) {
+        }
+        if k == n.len() {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn matches(f: &cli.Filter, t: &board.Task, today: date.Date) -> bool {
+    if not f.show_done and not t.is_open() {
+        return false;
+    }
+    if f.only_overdue and not t.is_overdue(today) {
+        return false;
+    }
+    if f.tag.len() > 0 and not t.has_tag(f.tag.view()) {
+        return false;
+    }
+    return contains_text(hay: t.title.view(), text: f.text.view());
+}
+
+// ---- in what form -------------------------------------------------------------------
+
+/// A form of list. Each writes only to the output it is given.
+pub type Report = interface {
+    fn begin(self: &mut Self, out: &mut std.Output);
+    fn row(self: &mut Self, out: &mut std.Output, t: &board.Task, today: date.Date);
+    fn end(self: &mut Self, out: &mut std.Output);
+}
+
+/// All the rows of a list, in a form.
+pub fn show(form: &mut dyn Report, out: &mut std.Output, b: &board.Board, places: []u32, today: date.Date) {
+    form.begin(out);
+    for p in places {
+        form.row(out, &b.tasks[p.* as usize], today: today);
+    }
+    form.end(out);
+}
+
+fn write_date(out: &mut std.Output, d: date.Date, a: alloc.Allocator) {
+    var s = alloc.String.init(a);
+    date.write(d, out: &mut s);
+    out.write(s.view());
+}
+
+fn spaces(out: &mut std.Output, n: usize) {
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        out.write(" ");
+    }
+}
+
+/// How many characters a number takes.
+fn width_of(n: u64) -> usize {
+    var left = n;
+    var w: usize = 1;
+    while left >= 10 : (left = left / 10) {
+        w += 1;
+    }
+    return w;
+}
+
+/// For a person: aligned, with what the deadline means today.
+pub type Table = struct {
+    rows: usize,
+    overdue: usize,
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Table {
+        return Table { rows: 0, overdue: 0, a: a };
+    }
+}
+
+fn write_deadline(out: &mut std.Output, t: &board.Task, today: date.Date, a: alloc.Allocator) {
+    // As wide as the widest of these, so that titles start in one column.
+    let column: usize = 27;
+    match t.due {
+        none => { spaces(out, column); }
+        some(d) => {
+            write_date(out, d, a);
+            var used: usize = 10;
+            if t.is_open() {
+                let left = date.days_between(from: today, to: d);
+                if left < 0 {
+                    let late = (-left) as u64;
+                    out.write(" (");
+                    out.write_u64(late);
+                    out.write(" kun o'tdi)");
+                    used += 2 + width_of(late) + 11;
+                } else if left == 0 {
+                    out.write(" (bugun)");
+                    used += 8;
+                } else {
+                    out.write(" (");
+                    out.write_u64(left as u64);
+                    out.write(" kun)");
+                    used += 2 + width_of(left as u64) + 5;
+                }
+            }
+            if used < column {
+                spaces(out, column - used);
+            }
+        }
+    }
+}
+
+impl Report for Table {
+    fn begin(self: &mut Table, out: &mut std.Output) {
+        self.rows = 0;
+        self.overdue = 0;
+    }
+
+    fn row(self: &mut Table, out: &mut std.Output, t: &board.Task, today: date.Date) {
+        spaces(out, 5 - width_of(t.id as u64));
+        out.write_u64(t.id as u64);
+        if t.is_open() {
+            out.write(" [ ] ");
+        } else {
+            out.write(" [x] ");
+        }
+        let name = t.priority.name();
+        out.write(name);
+        spaces(out, 7 - name.len());
+        write_deadline(out, t, today: today, a: self.a);
+        out.write(" ");
+        out.write(t.title.view());
+        for tag in t.tags.items() {
+            out.write(" #");
+            out.write(tag.view());
+        }
+        out.write("\n");
+        self.rows += 1;
+        if t.is_overdue(today) {
+            self.overdue += 1;
+        }
+    }
+
+    fn end(self: &mut Table, out: &mut std.Output) {
+        if self.rows == 0 {
+            out.write("Hech narsa topilmadi.\n");
+            return;
+        }
+        out.write_u64(self.rows as u64);
+        out.write(" ta vazifa");
+        if self.overdue > 0 {
+            out.write(", ");
+            out.write_u64(self.overdue as u64);
+            out.write(" tasi kechikkan");
+        }
+        out.write("\n");
+    }
+}
+
+/// For another program: RFC 4180.
+pub type Csv = struct {
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Csv {
+        return Csv { a: a };
+    }
+}
+
+/// The field, in quotes if it needs them, with its quotes doubled.
+pub fn csv_field(text: str, into: &mut alloc.String) {
+    var needs_quotes = false;
+    for c in text.bytes() {
+        if c.* == ',' or c.* == '"' or c.* == '\n' or c.* == '\r' {
+            needs_quotes = true;
+        }
+    }
+    if not needs_quotes {
+        into.push_str(text);
+        return;
+    }
+    into.push_ascii('"');
+    let b = text.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i < b.len() : (i += 1) {
+        if b[i] == '"' {
+            into.push_str(text[start..i + 1]);
+            into.push_ascii('"');
+            start = i + 1;
+        }
+    }
+    into.push_str(text[start..b.len()]);
+    into.push_ascii('"');
+}
+
+impl Report for Csv {
+    fn begin(self: &mut Csv, out: &mut std.Output) {
+        out.write("id,holat,muhimlik,muddat,yaratilgan,matn,teglar\n");
+    }
+
+    fn row(self: &mut Csv, out: &mut std.Output, t: &board.Task, today: date.Date) {
+        out.write_u64(t.id as u64);
+        if t.is_open() {
+            out.write(",ochiq,");
+        } else {
+            out.write(",bajarilgan,");
+        }
+        out.write(t.priority.name());
+        out.write(",");
+        match t.due {
+            some(d) => { write_date(out, d, self.a); }
+            none => { }
+        }
+        out.write(",");
+        write_date(out, t.created, self.a);
+        out.write(",");
+        var title = alloc.String.init(self.a);
+        csv_field(t.title.view(), into: &mut title);
+        out.write(title.view());
+        out.write(",");
+        var joined = alloc.String.init(self.a);
+        var first = true;
+        for tag in t.tags.items() {
+            if not first {
+                joined.push_ascii(';');
+            }
+            first = false;
+            joined.push_str(tag.view());
+        }
+        var tags = alloc.String.init(self.a);
+        csv_field(joined.view(), into: &mut tags);
+        out.write(tags.view());
+        out.write("\n");
+    }
+
+    fn end(self: &mut Csv, out: &mut std.Output) {
+    }
+}
+
+// ---- the numbers ---------------------------------------------------------------------
+
+fn write_line(out: &mut std.Output, label: str, n: usize) {
+    out.write(label);
+    spaces(out, 14 - utf8.count(label));
+    out.write_u64(n as u64);
+    out.write("\n");
+}
+
+const BAR_WIDTH: usize = 30;
+
+fn write_bar(out: &mut std.Output, part: usize, whole: usize) {
+    var filled: usize = 0;
+    if whole > 0 {
+        filled = part * BAR_WIDTH / whole;
+    }
+    out.write("[");
+    var i: usize = 0;
+    while i < BAR_WIDTH : (i += 1) {
+        if i < filled {
+            out.write("#");
+        } else {
+            out.write(".");
+        }
+    }
+    out.write("] ");
+    if whole > 0 {
+        out.write_u64((part * 100 / whole) as u64);
+    } else {
+        out.write("0");
+    }
+    out.write("%\n");
+}
+
+/// How many open tasks each tag has, in the order the tags first came.
+fn write_tags(out: &mut std.Output, b: &board.Board, a: alloc.Allocator) {
+    var names = alloc.Interner.init(a);
+    var counts = alloc.Map(alloc.Symbol, u32).init(a);
+    var order = alloc.List(alloc.Symbol).init(a);
+    for t in b.tasks.items() {
+        if not t.is_open() {
+            continue;
+        }
+        for tag in t.tags.items() {
+            let name = names.intern(tag.view());
+            match counts.get(name) {
+                some(n) => { counts.put(name, n + 1); }
+                none => {
+                    counts.put(name, 1);
+                    order.push(name);
+                }
+            }
+        }
+    }
+    if order.len() == 0 {
+        return;
+    }
+    out.write("\nOchiq vazifalar teglari:\n");
+    for name in order.items() {
+        out.write("  #");
+        out.write(names.text(name.*));
+        out.write(": ");
+        out.write_u64((counts.get(name.*) orelse 0) as u64);
+        out.write("\n");
+    }
+}
+
+pub fn stats(out: &mut std.Output, b: &board.Board, today: date.Date, a: alloc.Allocator) {
+    let tasks = b.tasks.items();
+    let is_there = fn [](t: &board.Task) -> bool { return not t.is_removed(); };
+    let is_open = fn [](t: &board.Task) -> bool { return t.is_open(); };
+    let is_late = fn [today](t: &board.Task) -> bool { return t.is_overdue(today); };
+    let is_urgent = fn [](t: &board.Task) -> bool { return t.is_open() and t.priority.rank() == 2; };
+    let total = board.count_where(board.Task, tasks, &is_there);
+    let open = board.count_where(board.Task, tasks, &is_open);
+    write_line(out, label: "Jami:", total);
+    write_line(out, label: "Ochiq:", open);
+    write_line(out, label: "Bajarilgan:", total - open);
+    write_line(out, label: "Kechikkan:", board.count_where(board.Task, tasks, &is_late));
+    write_line(out, label: "Yuqori:", board.count_where(board.Task, tasks, &is_urgent));
+    out.write("\nBajarilish: ");
+    write_bar(out, part: total - open, whole: total);
+    write_tags(out, b, a);
+}
+
+test "a text is found whatever its case" {
+    assert(contains_text(hay: "Hisobotni YOZISH", text: "yozish"));
+    assert(contains_text(hay: "abc", text: ""));
+    assert(not contains_text(hay: "ab", text: "abc"));
+    assert(not contains_text(hay: "hisobot", text: "yoz"));
+}
+
+test "a filter says who stays" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    let today = date.make(2026, month: 11, day: 10) orelse panic("a date");
+    let past = date.make(2026, month: 11, day: 1) orelse panic("a date");
+    var b = board.Board.init(a);
+    var tags = alloc.List(alloc.String).init(a);
+    tags.push(board.copy_text("ish", a));
+    _ = b.add("Hisobot", tags, board.Priority.High, due: date.lift(past), created: past);
+    let done = b.add("Tayyor", alloc.List(alloc.String).init(a), board.Priority.Low, due: none, created: past);
+    b.finish(done, on: today) catch panic("unexpected error");
+
+    var f = cli.Filter { show_done: false, only_overdue: false, tag: alloc.String.init(a), text: alloc.String.init(a) };
+    assert(matches(&f, &b.tasks[0], today: today));
+    assert(not matches(&f, &b.tasks[1], today: today));
+    f.show_done = true;
+    assert(matches(&f, &b.tasks[1], today: today));
+    f.only_overdue = true;
+    assert(matches(&f, &b.tasks[0], today: today));
+    assert(not matches(&f, &b.tasks[1], today: today));
+    f.tag = board.copy_text("uy", a);
+    assert(not matches(&f, &b.tasks[0], today: today));
+}
+
+test "a csv field gets quotes when it needs them" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    var plain = alloc.String.init(a);
+    csv_field("oddiy matn", into: &mut plain);
+    assert(plain.view().eq("oddiy matn"));
+    var quoted = alloc.String.init(a);
+    csv_field("a, \"b\"", into: &mut quoted);
+    assert(quoted.view().eq("\"a, \"\"b\"\"\""));
+}

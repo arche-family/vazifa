@@ -1,0 +1,264 @@
+/// The tasks in a file, as JSON. Writing goes through a second file and a
+/// rename, so that a crash cannot leave half of one.
+import alloc;
+import board;
+import core.fmt;
+import date;
+import std;
+import std.json;
+import std.testing as std_testing;
+
+pub type StoreError = error { CannotRead, CannotWrite, BadFormat }
+
+pub fn explain(e: StoreError) -> str {
+    match e {
+        .CannotRead => { return "vazifalar faylini o'qib bo'lmadi"; }
+        .CannotWrite => { return "vazifalar faylini yozib bo'lmadi"; }
+        .BadFormat => { return "vazifalar fayli buzilgan"; }
+    }
+}
+
+// ---- writing ------------------------------------------------------------------------
+
+fn push_number(out: &mut alloc.String, n: u64) {
+    var buf: [20]u8 = [0; 20];
+    let size = fmt.decimal(n, buf[0..20]);
+    var i: usize = 0;
+    while i < size : (i += 1) {
+        out.push_ascii(buf[i]);
+    }
+}
+
+fn push_date_field(out: &mut alloc.String, key: str, d: date.Date) {
+    out.push_str(", \"");
+    out.push_str(key);
+    out.push_str("\": \"");
+    date.write(d, out: out);
+    out.push_str("\"");
+}
+
+fn push_task(out: &mut alloc.String, t: &board.Task) {
+    out.push_str("    {\"id\": ");
+    push_number(out, t.id as u64);
+    out.push_str(", \"title\": ");
+    json.write_string(t.title.view(), out: out);
+    out.push_str(", \"priority\": \"");
+    out.push_str(t.priority.name());
+    out.push_str("\", \"tags\": [");
+    var i: usize = 0;
+    for tag in t.tags.items() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        json.write_string(tag.view(), out: out);
+        i += 1;
+    }
+    out.push_str("]");
+    push_date_field(out, key: "created", t.created);
+    match t.due {
+        some(d) => { push_date_field(out, key: "due", d); }
+        none => { }
+    }
+    match t.status {
+        .Done { on } => { push_date_field(out, key: "done", on); }
+        _ => { }
+    }
+    out.push_str("}");
+}
+
+/// The board as text. A removed task is left out: its id is not reused, because
+/// next_id is kept.
+pub fn encode(b: &board.Board, a: alloc.Allocator) -> alloc.String {
+    var out = alloc.String.init(a);
+    out.push_str("{\n  \"next_id\": ");
+    push_number(&mut out, b.next_id as u64);
+    out.push_str(",\n  \"tasks\": [\n");
+    var first = true;
+    for t in b.tasks.items() {
+        if t.is_removed() {
+            continue;
+        }
+        if not first {
+            out.push_str(",\n");
+        }
+        first = false;
+        push_task(&mut out, t);
+    }
+    out.push_str("\n  ]\n}\n");
+    return out;
+}
+
+pub fn save(fs: &std.Fs, path: str, b: &board.Board, a: alloc.Allocator) -> StoreError!void {
+    let text = encode(b, a);
+    var temporary = board.copy_text(path, a);
+    temporary.push_str(".tmp");
+    match fs.write_file(path: temporary.view(), data: text.view()) {
+        ok(_) => { }
+        err(_) => { return StoreError.CannotWrite; }
+    }
+    match fs.rename(from: temporary.view(), to: path) {
+        ok(_) => { }
+        err(_) => { return StoreError.CannotWrite; }
+    }
+}
+
+// ---- reading ------------------------------------------------------------------------
+
+/// The member of an object at the place key_index said.
+fn member(v: &json.Value, place: usize) -> &json.Value {
+    match v {
+        .Object { values, .. } => { return &values.items()[place]; }
+        _ => { panic("key_index found a key in what is no object"); }
+    }
+}
+
+fn place_of(v: &json.Value, key: str) -> StoreError!usize {
+    match json.key_index(v, key) {
+        some(i) => { return i; }
+        none => { return StoreError.BadFormat; }
+    }
+}
+
+fn copy_of_text(v: &json.Value, a: alloc.Allocator) -> StoreError!alloc.String {
+    match v {
+        .Text { value } => { return board.copy_text(value.view(), a); }
+        _ => { return StoreError.BadFormat; }
+    }
+}
+
+fn date_of(v: &json.Value) -> StoreError!date.Date {
+    match v {
+        .Text { value } => {
+            match date.parse(value.view()) {
+                some(d) => { return d; }
+                none => { return StoreError.BadFormat; }
+            }
+        }
+        _ => { return StoreError.BadFormat; }
+    }
+}
+
+fn u32_of(v: &json.Value) -> StoreError!u32 {
+    match json.as_i64(v) {
+        some(n) => {
+            if n < 0 or n > 4294967295 {
+                return StoreError.BadFormat;
+            }
+            return n as u32;
+        }
+        none => { return StoreError.BadFormat; }
+    }
+}
+
+fn read_task(v: &json.Value, a: alloc.Allocator) -> StoreError!board.Task {
+    let id = try u32_of(member(v, place: try place_of(v, key: "id")));
+    let title = try copy_of_text(member(v, place: try place_of(v, key: "title")), a);
+    let priority_name = try copy_of_text(member(v, place: try place_of(v, key: "priority")), a);
+    var priority = board.Priority.Normal;
+    match board.Priority.parse(priority_name.view()) {
+        some(p) => { priority = p; }
+        none => { return StoreError.BadFormat; }
+    }
+    var tags = alloc.List(alloc.String).init(a);
+    match member(v, place: try place_of(v, key: "tags")) {
+        .Array { items } => {
+            for item in items.items() {
+                tags.push(try copy_of_text(item, a));
+            }
+        }
+        _ => { return StoreError.BadFormat; }
+    }
+    let created = try date_of(member(v, place: try place_of(v, key: "created")));
+    var due: ?date.Date = none;
+    match json.key_index(v, "due") {
+        some(i) => { due = date.lift(try date_of(member(v, place: i))); }
+        none => { }
+    }
+    var status = board.Status.Open;
+    match json.key_index(v, "done") {
+        some(i) => { status = board.Status.Done { on: try date_of(member(v, place: i)) }; }
+        none => { }
+    }
+    return board.Task { id: id, title: title, tags: tags, priority: priority, created: created, due: due, status: status };
+}
+
+/// The board in this text.
+pub fn decode(text: str, a: alloc.Allocator) -> StoreError!board.Board {
+    var parsed = json.Value.Null;
+    match json.parse(text, a) {
+        ok(v) => { parsed = v; }
+        err(_) => { return StoreError.BadFormat; }
+    }
+    var b = board.Board.init(a);
+    match member(&parsed, place: try place_of(&parsed, key: "tasks")) {
+        .Array { items } => {
+            for item in items.items() {
+                b.restore(try read_task(item, a));
+            }
+        }
+        _ => { return StoreError.BadFormat; }
+    }
+    let next = try u32_of(member(&parsed, place: try place_of(&parsed, key: "next_id")));
+    if next > b.next_id {
+        b.next_id = next;
+    }
+    return b;
+}
+
+/// The board in the file; an empty one if there is no such file yet.
+pub fn load(fs: &std.Fs, path: str, a: alloc.Allocator) -> StoreError!board.Board {
+    if not fs.exists(path) {
+        return board.Board.init(a);
+    }
+    match fs.read_file(path, a) {
+        ok(text) => { return try decode(text.view(), a); }
+        err(_) => { return StoreError.CannotRead; }
+    }
+}
+
+fn day(n: u8) -> date.Date {
+    return date.make(2026, month: 11, day: n) orelse panic("a date");
+}
+
+test "what is saved reads back the same" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    var b = board.Board.init(a);
+    var tags = alloc.List(alloc.String).init(a);
+    tags.push(board.copy_text("ish", a));
+    tags.push(board.copy_text("\"muhim\" yangi\nqator", a));
+    let first = b.add("Hisobot: \"oy yakuni\"", tags, board.Priority.High, due: date.lift(day(20)), created: day(1));
+    let second = b.add("Ikkinchi", alloc.List(alloc.String).init(a), board.Priority.Low, due: none, created: day(2));
+    let third = b.add("O'chiriladi", alloc.List(alloc.String).init(a), board.Priority.Normal, due: none, created: day(2));
+    b.finish(second, on: day(3)) catch panic("unexpected error");
+    b.remove(third) catch panic("unexpected error");
+
+    let text = encode(&b, a);
+    let back = decode(text.view(), a) catch panic("unexpected error");
+    assert(back.tasks.len() == 2);
+    assert(back.next_id == 4);
+    assert(back.tasks[0].id == first);
+    assert(back.tasks[0].title.view().eq("Hisobot: \"oy yakuni\""));
+    assert(back.tasks[0].tags.len() == 2);
+    assert(back.tasks[0].tags[1].view().eq("\"muhim\" yangi\nqator"));
+    assert(back.tasks[0].is_open());
+    assert(not back.tasks[1].is_open());
+    // Written again, it is the same bytes.
+    let again = encode(&back, a);
+    assert(again.view().eq(text.view()));
+}
+
+test "a broken file is said to be so" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    match decode("{\"tasks\": [", a) {
+        err(.BadFormat) => { }
+        _ => { panic("bad text was read"); }
+    }
+    match decode("{\"next_id\": 1, \"tasks\": [{\"id\": 1}]}", a) {
+        err(.BadFormat) => { }
+        _ => { panic("a task with no title was read"); }
+    }
+    match decode("[1, 2]", a) {
+        err(.BadFormat) => { }
+        _ => { panic("a list was read"); }
+    }
+}

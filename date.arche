@@ -1,0 +1,184 @@
+/// Calendar dates, with no time and no zone in them: what a deadline needs.
+import alloc;
+import core;
+import core.fmt;
+import std;
+
+/// Tashkent is UTC+5, all year: what "today" means to this program.
+const UTC_OFFSET_SECONDS: u64 = 5 * 3600;
+const SECONDS_IN_DAY: u64 = 86400;
+
+pub type Date = struct {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+}
+
+impl core.Eq for Date {
+    fn eq(self: &Date, other: &Date) -> bool {
+        return self.year == other.year and self.month == other.month and self.day == other.day;
+    }
+}
+
+impl core.Ord for Date {
+    fn less(self: &Date, other: &Date) -> bool {
+        return to_days(self.*) < to_days(other.*);
+    }
+}
+
+fn is_leap(year: i32) -> bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        2 => {
+            if is_leap(year) {
+                return 29;
+            }
+            return 28;
+        }
+        4 | 6 | 9 | 11 => { return 30; }
+        _ => { return 31; }
+    }
+}
+
+/// The date, if there is such a date.
+pub fn make(year: i32, month: u8, day: u8) -> ?Date {
+    if year < 1 or year > 9999 or month < 1 or month > 12 or day < 1 or day > days_in_month(year, month: month) {
+        return none;
+    }
+    return Date { year: year, month: month, day: day };
+}
+
+fn digits(t: []u8) -> ?u32 {
+    var n: u32 = 0;
+    for c in t {
+        if c.* < '0' or c.* > '9' {
+            return none;
+        }
+        n = n * 10 + (c.* - '0') as u32;
+    }
+    return n;
+}
+
+/// The date as an optional one: the language lifts a value only at a return.
+pub fn lift(d: Date) -> ?Date {
+    return d;
+}
+
+/// A date written as YYYY-MM-DD.
+pub fn parse(text: str) -> ?Date {
+    let b = text.bytes();
+    if b.len() != 10 or b[4] != '-' or b[7] != '-' {
+        return none;
+    }
+    let year = digits(b[0..4]) orelse 0;
+    let month = digits(b[5..7]) orelse 0;
+    let day = digits(b[8..10]) orelse 0;
+    return make(year as i32, month: month as u8, day: day as u8);
+}
+
+/// Days since 1970-01-01, by the proleptic Gregorian calendar.
+pub fn to_days(d: Date) -> i64 {
+    var y = d.year as i64;
+    let m = d.month as i64;
+    if m <= 2 {
+        y -= 1;
+    }
+    let era = y / 400;
+    let year_of_era = y - era * 400;
+    var month_from_march = m - 3;
+    if m <= 2 {
+        month_from_march = m + 9;
+    }
+    let day_of_year = (153 * month_from_march + 2) / 5 + d.day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    return era * 146097 + day_of_era - 719468;
+}
+
+/// The date that many days after 1970-01-01. Not before that date.
+pub fn from_days(days: i64) -> Date {
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    var month = mp + 3;
+    if mp >= 10 {
+        month = mp - 9;
+    }
+    var year = yoe + era * 400;
+    if month <= 2 {
+        year += 1;
+    }
+    return Date { year: year as i32, month: month as u8, day: day as u8 };
+}
+
+/// How many days from one date to another: negative if it has passed.
+pub fn days_between(from: Date, to: Date) -> i64 {
+    return to_days(to) - to_days(from);
+}
+
+pub fn today(clock: &std.Clock) -> Date {
+    let seconds = clock.unix_ns() / 1000000000 + UTC_OFFSET_SECONDS;
+    return from_days((seconds / SECONDS_IN_DAY) as i64);
+}
+
+fn push_padded(out: &mut alloc.String, value: u64, width: usize) {
+    var buf: [20]u8 = [0; 20];
+    let n = fmt.decimal(value, buf[0..20]);
+    var pad = n;
+    while pad < width : (pad += 1) {
+        out.push_ascii('0');
+    }
+    var i: usize = 0;
+    while i < n : (i += 1) {
+        out.push_ascii(buf[i]);
+    }
+}
+
+/// As YYYY-MM-DD: what parse reads.
+pub fn write(d: Date, out: &mut alloc.String) {
+    push_padded(out, d.year as u64, width: 4);
+    out.push_ascii('-');
+    push_padded(out, d.month as u64, width: 2);
+    out.push_ascii('-');
+    push_padded(out, d.day as u64, width: 2);
+}
+
+fn is_date(d: ?Date) -> bool {
+    match d {
+        some(_) => { return true; }
+        none => { return false; }
+    }
+}
+
+test "the calendar knows its leap years" {
+    assert(is_date(make(2024, month: 2, day: 29)));
+    assert(not is_date(make(2023, month: 2, day: 29)));
+    assert(not is_date(make(1900, month: 2, day: 29)));
+    assert(is_date(make(2000, month: 2, day: 29)));
+}
+
+test "parse refuses what is not a date" {
+    assert(is_date(parse("2026-11-06")));
+    assert(not is_date(parse("2026-13-01")));
+    assert(not is_date(parse("2026-1-1")));
+    assert(not is_date(parse("yesterday!")));
+}
+
+test "days go there and back" {
+    let start = make(1970, month: 1, day: 1) orelse panic("a date");
+    assert(to_days(start) == 0);
+    var day: i64 = 0;
+    while day < 40000 : (day += 137) {
+        assert(to_days(from_days(day)) == day);
+    }
+    let a = make(2026, month: 2, day: 27) orelse panic("a date");
+    let b = make(2026, month: 3, day: 2) orelse panic("a date");
+    assert(days_between(from: a, to: b) == 3);
+    assert(days_between(from: b, to: a) == -3);
+}

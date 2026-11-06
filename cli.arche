@@ -1,0 +1,272 @@
+/// The command line, as words: what the user asked for, or why it makes no sense.
+import alloc;
+import board;
+import date;
+import std.testing as std_testing;
+
+pub type Format = enum { Table, Csv }
+
+/// Which tasks a list shows. An empty tag or text asks for nothing.
+pub type Filter = struct {
+    pub show_done: bool,
+    pub only_overdue: bool,
+    pub tag: alloc.String,
+    pub text: alloc.String,
+}
+
+pub type Command = enum {
+    Help,
+    Add { title: alloc.String, tags: alloc.List(alloc.String), priority: board.Priority, due: ?date.Date },
+    Show { filter: Filter, format: Format },
+    Finish { id: u32 },
+    Reopen { id: u32 },
+    Remove { id: u32 },
+    Stats,
+}
+
+pub type CliError = error {
+    UnknownCommand,
+    UnknownOption,
+    MissingValue,
+    MissingTitle,
+    MissingId,
+    BadNumber,
+    BadDate,
+    BadPriority,
+    BadFormat,
+}
+
+/// What each error means, to who typed the command.
+pub fn explain(e: CliError) -> str {
+    match e {
+        .UnknownCommand => { return "bunday buyruq yo'q"; }
+        .UnknownOption => { return "bunday parametr yo'q"; }
+        .MissingValue => { return "parametrning qiymati berilmagan"; }
+        .MissingTitle => { return "vazifa matni berilmagan"; }
+        .MissingId => { return "vazifa raqami berilmagan"; }
+        .BadNumber => { return "vazifa raqami noto'g'ri"; }
+        .BadDate => { return "sana YYYY-MM-DD ko'rinishida bo'lishi kerak"; }
+        .BadPriority => { return "muhimlik past, oddiy yoki yuqori bo'lishi kerak"; }
+        .BadFormat => { return "format table yoki csv bo'lishi kerak"; }
+    }
+}
+
+fn parse_id(text: str) -> CliError!u32 {
+    let b = text.bytes();
+    if b.len() == 0 or b.len() > 9 {
+        return CliError.BadNumber;
+    }
+    var n: u32 = 0;
+    for c in b {
+        if c.* < '0' or c.* > '9' {
+            return CliError.BadNumber;
+        }
+        n = n * 10 + (c.* - '0') as u32;
+    }
+    return n;
+}
+
+/// The word after the option at i.
+fn value_after(words: []alloc.String, i: usize) -> CliError!usize {
+    if i + 1 >= words.len() {
+        return CliError.MissingValue;
+    }
+    return i + 1;
+}
+
+fn parse_add(words: []alloc.String, a: alloc.Allocator) -> CliError!Command {
+    var title = alloc.String.init(a);
+    var tags = alloc.List(alloc.String).init(a);
+    var priority = board.Priority.Normal;
+    var due: ?date.Date = none;
+    var i: usize = 1;
+    while i < words.len() : (i += 1) {
+        let word = words[i].view();
+        if word.eq("--tag") or word.eq("-t") {
+            i = try value_after(words, i: i);
+            tags.push(board.copy_text(words[i].view(), a));
+        } else if word.eq("--muhim") or word.eq("-m") {
+            i = try value_after(words, i: i);
+            match board.Priority.parse(words[i].view()) {
+                some(p) => { priority = p; }
+                none => { return CliError.BadPriority; }
+            }
+        } else if word.eq("--muddat") or word.eq("-d") {
+            i = try value_after(words, i: i);
+            match date.parse(words[i].view()) {
+                some(d) => { due = date.lift(d); }
+                none => { return CliError.BadDate; }
+            }
+        } else if word.starts_with("-") {
+            return CliError.UnknownOption;
+        } else {
+            // The words of the title need no quotes.
+            if title.len() > 0 {
+                title.push_ascii(' ');
+            }
+            title.push_str(word);
+        }
+    }
+    if title.len() == 0 {
+        return CliError.MissingTitle;
+    }
+    return Command.Add { title: title, tags: tags, priority: priority, due: due };
+}
+
+fn parse_list(words: []alloc.String, a: alloc.Allocator) -> CliError!Command {
+    var filter = Filter { show_done: false, only_overdue: false, tag: alloc.String.init(a), text: alloc.String.init(a) };
+    var format = Format.Table;
+    var i: usize = 1;
+    while i < words.len() : (i += 1) {
+        let word = words[i].view();
+        if word.eq("--hammasi") or word.eq("-a") {
+            filter.show_done = true;
+        } else if word.eq("--kechikkan") {
+            filter.only_overdue = true;
+        } else if word.eq("--tag") or word.eq("-t") {
+            i = try value_after(words, i: i);
+            filter.tag = board.copy_text(words[i].view(), a);
+        } else if word.eq("--qidir") or word.eq("-q") {
+            i = try value_after(words, i: i);
+            filter.text = board.copy_text(words[i].view(), a);
+        } else if word.eq("--format") {
+            i = try value_after(words, i: i);
+            let name = words[i].view();
+            if name.eq("table") {
+                format = Format.Table;
+            } else if name.eq("csv") {
+                format = Format.Csv;
+            } else {
+                return CliError.BadFormat;
+            }
+        } else {
+            return CliError.UnknownOption;
+        }
+    }
+    return Command.Show { filter: filter, format: format };
+}
+
+fn parse_one_id(words: []alloc.String) -> CliError!u32 {
+    if words.len() < 2 {
+        return CliError.MissingId;
+    }
+    return try parse_id(words[1].view());
+}
+
+/// What the words ask for: the program's own name is not among them.
+pub fn parse(words: []alloc.String, a: alloc.Allocator) -> CliError!Command {
+    if words.len() == 0 {
+        return Command.Help;
+    }
+    let name = words[0].view();
+    if name.eq("yordam") or name.eq("--help") or name.eq("-h") {
+        return Command.Help;
+    }
+    if name.eq("qosh") {
+        return try parse_add(words, a);
+    }
+    if name.eq("royxat") {
+        return try parse_list(words, a);
+    }
+    if name.eq("bajar") {
+        return Command.Finish { id: try parse_one_id(words) };
+    }
+    if name.eq("qaytar") {
+        return Command.Reopen { id: try parse_one_id(words) };
+    }
+    if name.eq("ochir") {
+        return Command.Remove { id: try parse_one_id(words) };
+    }
+    if name.eq("statistika") {
+        return Command.Stats;
+    }
+    return CliError.UnknownCommand;
+}
+
+/// The words of the command line after the program's name, without a --file and
+/// its value; path gets that value.
+pub fn take_file_option(words: []alloc.String, path: &mut alloc.String, a: alloc.Allocator) -> CliError!alloc.List(alloc.String) {
+    var rest = alloc.List(alloc.String).init(a);
+    var i: usize = 0;
+    while i < words.len() : (i += 1) {
+        if words[i].view().eq("--fayl") {
+            i = try value_after(words, i: i);
+            path.* = board.copy_text(words[i].view(), a);
+        } else {
+            rest.push(board.copy_text(words[i].view(), a));
+        }
+    }
+    return rest;
+}
+
+fn split_words(line: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
+    var list = alloc.List(alloc.String).init(a);
+    let b = line.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= b.len() : (i += 1) {
+        if i == b.len() or b[i] == ' ' {
+            list.push(board.copy_text(line[start..i], a));
+            start = i + 1;
+        }
+    }
+    return list;
+}
+
+test "add takes a title of many words, and its options anywhere" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    let w = split_words("qosh hisobot -m yuqori yozish -t ish -d 2026-12-01 -t uy", a);
+    match parse(w.items(), a) {
+        ok(.Add { title, tags, priority, due }) => {
+            assert(title.view().eq("hisobot yozish"));
+            assert(tags.len() == 2 and tags[1].view().eq("uy"));
+            assert(priority.rank() == board.Priority.High.rank());
+            match due {
+                some(d) => { assert(d.day == 1); }
+                none => { panic("no deadline"); }
+            }
+        }
+        _ => { panic("not an add"); }
+    }
+}
+
+test "each mistake has its own error" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    match parse(split_words("qosh", a).items(), a) {
+        err(.MissingTitle) => { }
+        _ => { panic("no title"); }
+    }
+    match parse(split_words("qosh x -d ertaga", a).items(), a) {
+        err(.BadDate) => { }
+        _ => { panic("bad date"); }
+    }
+    match parse(split_words("qosh x -m juda", a).items(), a) {
+        err(.BadPriority) => { }
+        _ => { panic("bad priority"); }
+    }
+    match parse(split_words("qosh x -t", a).items(), a) {
+        err(.MissingValue) => { }
+        _ => { panic("no value"); }
+    }
+    match parse(split_words("bajar", a).items(), a) {
+        err(.MissingId) => { }
+        _ => { panic("no id"); }
+    }
+    match parse(split_words("bajar 1x", a).items(), a) {
+        err(.BadNumber) => { }
+        _ => { panic("bad id"); }
+    }
+    match parse(split_words("uxla", a).items(), a) {
+        err(.UnknownCommand) => { }
+        _ => { panic("no such command"); }
+    }
+}
+
+test "the file option can be anywhere" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    let w = split_words("royxat --fayl boshqa.json -a", a);
+    var path = alloc.String.init(a);
+    let rest = take_file_option(w.items(), path: &mut path, a: a) catch panic("unexpected error");
+    assert(path.view().eq("boshqa.json"));
+    assert(rest.len() == 2 and rest[1].view().eq("-a"));
+}

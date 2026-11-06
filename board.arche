@@ -1,0 +1,297 @@
+/// The tasks: what they are, and what may be done to them. Nothing here does any
+/// input or output, so all of it can be tested with no file and no clock.
+import alloc;
+import core;
+import core.slice;
+import date;
+import std.testing as std_testing;
+
+pub type Priority = enum {
+    Low,
+    Normal,
+    High,
+
+    pub fn rank(self: Priority) -> u8 {
+        match self {
+            .Low => { return 0; }
+            .Normal => { return 1; }
+            .High => { return 2; }
+        }
+    }
+
+    pub fn name(self: Priority) -> str {
+        match self {
+            .Low => { return "past"; }
+            .Normal => { return "oddiy"; }
+            .High => { return "yuqori"; }
+        }
+    }
+
+    pub fn parse(text: str) -> ?Priority {
+        if text.eq("past") {
+            return Priority.Low;
+        }
+        if text.eq("oddiy") {
+            return Priority.Normal;
+        }
+        if text.eq("yuqori") {
+            return Priority.High;
+        }
+        return none;
+    }
+}
+
+pub type Status = enum {
+    Open,
+    Done { on: date.Date },
+    /// It stays in its place until the next save: ids and places of the others
+    /// do not move.
+    Removed,
+}
+
+pub type Task = struct {
+    pub id: u32,
+    pub title: alloc.String,
+    pub tags: alloc.List(alloc.String),
+    pub priority: Priority,
+    pub created: date.Date,
+    pub due: ?date.Date,
+    pub status: Status,
+
+    pub fn is_open(self: &Task) -> bool {
+        match self.status {
+            .Open => { return true; }
+            _ => { return false; }
+        }
+    }
+
+    pub fn is_removed(self: &Task) -> bool {
+        match self.status {
+            .Removed => { return true; }
+            _ => { return false; }
+        }
+    }
+
+    /// Open, with its deadline before this day.
+    pub fn is_overdue(self: &Task, today: date.Date) -> bool {
+        match self.due {
+            some(d) => { return self.is_open() and date.days_between(from: today, to: d) < 0; }
+            none => { return false; }
+        }
+    }
+
+    pub fn has_tag(self: &Task, tag: str) -> bool {
+        for t in self.tags.items() {
+            if t.view().eq(tag) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+pub type BoardError = error { NoSuchTask, AlreadyDone, NotDone }
+
+/// How tasks are ordered in a list: open ones first, then the more important,
+/// then the sooner due, with no deadline last, then the older.
+type Rank = struct {
+    closed: bool,
+    urgency: u8,
+    due_days: i64,
+    id: u32,
+    place: u32,
+}
+
+impl core.Ord for Rank {
+    fn less(self: &Rank, other: &Rank) -> bool {
+        if self.closed != other.closed {
+            return other.closed;
+        }
+        if self.urgency != other.urgency {
+            return self.urgency > other.urgency;
+        }
+        if self.due_days != other.due_days {
+            return self.due_days < other.due_days;
+        }
+        return self.id < other.id;
+    }
+}
+
+const NO_DEADLINE: i64 = 9223372036854775807;
+
+fn rank_of(t: &Task, place: usize) -> Rank {
+    var due_days = NO_DEADLINE;
+    match t.due {
+        some(d) => { due_days = date.to_days(d); }
+        none => { }
+    }
+    return Rank { closed: not t.is_open(), urgency: t.priority.rank(), due_days: due_days, id: t.id, place: place as u32 };
+}
+
+pub fn copy_text(text: str, a: alloc.Allocator) -> alloc.String {
+    var s = alloc.String.init(a);
+    s.push_str(text);
+    return s;
+}
+
+pub type Board = struct {
+    pub tasks: alloc.List(Task),
+    pub next_id: u32,
+    a: alloc.Allocator,
+
+    pub fn init(a: alloc.Allocator) -> Board {
+        return Board { tasks: alloc.List(Task).init(a), next_id: 1, a: a };
+    }
+
+    /// A new open task: its id.
+    pub fn add(self: &mut Board, title: str, tags: alloc.List(alloc.String), priority: Priority, due: ?date.Date, created: date.Date) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tasks.push(Task { id: id, title: copy_text(title, self.a), tags: tags, priority: priority, created: created, due: due, status: Status.Open });
+        return id;
+    }
+
+    /// A task as it was saved.
+    pub fn restore(self: &mut Board, t: Task) {
+        if t.id >= self.next_id {
+            self.next_id = t.id + 1;
+        }
+        self.tasks.push(t);
+    }
+
+    fn place_of(self: &Board, id: u32) -> BoardError!usize {
+        var i: usize = 0;
+        for t in self.tasks.items() {
+            if t.id == id and not t.is_removed() {
+                return i;
+            }
+            i += 1;
+        }
+        return BoardError.NoSuchTask;
+    }
+
+    pub fn finish(self: &mut Board, id: u32, on: date.Date) -> BoardError!void {
+        let i = try self.place_of(id);
+        if not self.tasks[i].is_open() {
+            return BoardError.AlreadyDone;
+        }
+        self.tasks[i].status = Status.Done { on: on };
+    }
+
+    pub fn reopen(self: &mut Board, id: u32) -> BoardError!void {
+        let i = try self.place_of(id);
+        if self.tasks[i].is_open() {
+            return BoardError.NotDone;
+        }
+        self.tasks[i].status = Status.Open;
+    }
+
+    pub fn remove(self: &mut Board, id: u32) -> BoardError!void {
+        let i = try self.place_of(id);
+        self.tasks[i].status = Status.Removed;
+    }
+
+    /// The places of the tasks keep says yes to, in the order a list shows them.
+    pub fn select(self: &Board, keep: &dyn fn(&Task) -> bool, a: alloc.Allocator) -> alloc.List(u32) {
+        var ranks = alloc.List(Rank).init(a);
+        var i: usize = 0;
+        for t in self.tasks.items() {
+            if not t.is_removed() and keep(t) {
+                ranks.push(rank_of(t, place: i));
+            }
+            i += 1;
+        }
+        slice.sort(Rank, ranks.items_mut());
+        var places = alloc.List(u32).init(a);
+        for r in ranks.items() {
+            places.push(r.place);
+        }
+        return places;
+    }
+}
+
+/// How many of the items a test says yes to: for any kind of item.
+pub fn count_where(comptime T: type, items: []T, test_item: &dyn fn(&T) -> bool) -> usize {
+    var n: usize = 0;
+    for item in items {
+        if test_item(item) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn some_day(day: u8) -> date.Date {
+    return date.make(2026, month: 11, day: day) orelse panic("a date");
+}
+
+fn no_tags(a: alloc.Allocator) -> alloc.List(alloc.String) {
+    return alloc.List(alloc.String).init(a);
+}
+
+test "ids keep growing, and removing does not reuse one" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    var b = Board.init(a);
+    let first = b.add("bir", no_tags(a), Priority.Normal, due: none, created: some_day(1));
+    let second = b.add("ikki", no_tags(a), Priority.Normal, due: none, created: some_day(1));
+    assert(first == 1 and second == 2);
+    b.remove(first) catch panic("unexpected error");
+    let third = b.add("uch", no_tags(a), Priority.Normal, due: none, created: some_day(1));
+    assert(third == 3);
+    match b.remove(first) {
+        err(.NoSuchTask) => { }
+        _ => { panic("removed twice"); }
+    }
+}
+
+test "a task is finished once, and can be reopened" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    var b = Board.init(a);
+    let id = b.add("bir", no_tags(a), Priority.High, due: none, created: some_day(1));
+    b.finish(id, on: some_day(2)) catch panic("unexpected error");
+    match b.finish(id, on: some_day(3)) {
+        err(.AlreadyDone) => { }
+        _ => { panic("finished twice"); }
+    }
+    b.reopen(id) catch panic("unexpected error");
+    assert(b.tasks[0].is_open());
+    match b.reopen(id) {
+        err(.NotDone) => { }
+        _ => { panic("reopened twice"); }
+    }
+}
+
+test "a list puts first what matters most" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    var b = Board.init(a);
+    let later = b.add("keyin", no_tags(a), Priority.Normal, due: date.lift(some_day(20)), created: some_day(1));
+    let sooner = b.add("tezroq", no_tags(a), Priority.Normal, due: date.lift(some_day(10)), created: some_day(1));
+    let urgent = b.add("shoshilinch", no_tags(a), Priority.High, due: none, created: some_day(1));
+    let whenever = b.add("bir kun", no_tags(a), Priority.Normal, due: none, created: some_day(1));
+    let done = b.add("tayyor", no_tags(a), Priority.High, due: date.lift(some_day(2)), created: some_day(1));
+    b.finish(done, on: some_day(2)) catch panic("unexpected error");
+    let all = fn [](x: &Task) -> bool { return true; };
+    let order = b.select(&all, a);
+    assert(order.len() == 5);
+    assert(b.tasks[order[0] as usize].id == urgent);
+    assert(b.tasks[order[1] as usize].id == sooner);
+    assert(b.tasks[order[2] as usize].id == later);
+    assert(b.tasks[order[3] as usize].id == whenever);
+    assert(b.tasks[order[4] as usize].id == done);
+}
+
+test "count_where works on any items" {
+    var numbers: [5]u32 = [1, 2, 3, 4, 5];
+    let is_even = fn [](x: &u32) -> bool { return x.* % 2 == 0; };
+    assert(count_where(u32, numbers[0..5], &is_even) == 2);
+}
+
+test "overdue means open and past its day" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    var b = Board.init(a);
+    let id = b.add("bir", no_tags(a), Priority.Low, due: date.lift(some_day(5)), created: some_day(1));
+    assert(not b.tasks[0].is_overdue(some_day(5)));
+    assert(b.tasks[0].is_overdue(some_day(6)));
+    b.finish(id, on: some_day(7)) catch panic("unexpected error");
+    assert(not b.tasks[0].is_overdue(some_day(8)));
+}

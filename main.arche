@@ -1,0 +1,188 @@
+// vazifa: a task list for the terminal.
+//
+// This file is the only one that holds std.System. Everything below it is given
+// just the capabilities it needs, so a signature says what a function can touch:
+// store.load takes a file system and no clock, report.show an output and no
+// files, and board takes nothing at all.
+import alloc;
+import board;
+import cli;
+import date;
+import report;
+import std;
+import store;
+
+const DEFAULT_FILE: str = "vazifalar.json";
+
+/// Why a command did not happen. Each has its words for the user.
+type Failed = error { Usage, Saving, NoSuchTask, AlreadyDone, NotDone }
+
+fn write_help(out: &mut std.Output) {
+    out.write("vazifa: vazifalarni terminalda yuritish\n\n");
+    out.write("Buyruqlar:\n");
+    out.write("  qosh <matn> [-m past|oddiy|yuqori] [-d YYYY-MM-DD] [-t teg]...\n");
+    out.write("                       yangi vazifa\n");
+    out.write("  royxat [-a] [-t teg] [-q matn] [--kechikkan] [--format table|csv]\n");
+    out.write("                       vazifalar: -a bajarilganlari bilan\n");
+    out.write("  bajar <raqam>        vazifani bajarilgan deb belgilash\n");
+    out.write("  qaytar <raqam>       bajarilgan vazifani qayta ochish\n");
+    out.write("  ochir <raqam>        vazifani o'chirish\n");
+    out.write("  statistika           umumiy holat va teglar\n");
+    out.write("  yordam               shu matn\n\n");
+    out.write("Fayl: --fayl <yo'l>, VAZIFA_FAYL muhit o'zgaruvchisi, yoki ./vazifalar.json\n");
+}
+
+fn say_error(err_out: &mut std.Output, text: str) {
+    err_out.write("xato: ");
+    err_out.write(text);
+    err_out.write("\n");
+}
+
+fn say_task(out: &mut std.Output, verb: str, id: u32) {
+    out.write(verb);
+    out.write(" #");
+    out.write_u64(id as u64);
+    out.write("\n");
+}
+
+fn board_failure(err_out: &mut std.Output, e: board.BoardError, id: u32) -> Failed {
+    err_out.write("xato: #");
+    err_out.write_u64(id as u64);
+    match e {
+        .NoSuchTask => {
+            err_out.write(" raqamli vazifa yo'q\n");
+            return Failed.NoSuchTask;
+        }
+        .AlreadyDone => {
+            err_out.write(" allaqachon bajarilgan\n");
+            return Failed.AlreadyDone;
+        }
+        .NotDone => {
+            err_out.write(" hali bajarilmagan\n");
+            return Failed.NotDone;
+        }
+    }
+}
+
+/// Keeps what a command changed.
+fn save_board(fs: &std.Fs, err_out: &mut std.Output, path: str, b: &board.Board, a: alloc.Allocator) -> Failed!void {
+    match store.save(fs, path: path, b, a) {
+        ok(_) => { }
+        err(e) => {
+            say_error(err_out, store.explain(e));
+            return Failed.Saving;
+        }
+    }
+}
+
+fn list_tasks(out: &mut std.Output, b: &board.Board, filter: &cli.Filter, format: cli.Format, today: date.Date, a: alloc.Allocator) {
+    let keep = fn [filter, today](t: &board.Task) -> bool { return report.matches(filter, t, today: today); };
+    let places = b.select(&keep, a);
+    match format {
+        .Table => {
+            var form = report.Table.init(a);
+            report.show(&mut form, out: out, b, places: places.items(), today: today);
+        }
+        .Csv => {
+            var form = report.Csv.init(a);
+            report.show(&mut form, out: out, b, places: places.items(), today: today);
+        }
+    }
+}
+
+/// Does what the command says. Only the commands that change something save.
+fn run_command(sys: &mut std.System, command: cli.Command, path: str, a: alloc.Allocator) -> Failed!void {
+    if not needs_board(&command) {
+        write_help(&mut sys.stdout);
+        return;
+    }
+    var b = board.Board.init(a);
+    match store.load(&sys.fs, path: path, a) {
+        ok(loaded) => { b = loaded; }
+        err(e) => {
+            say_error(&mut sys.stderr, store.explain(e));
+            return Failed.Saving;
+        }
+    }
+    let today = date.today(&sys.clock);
+    match command {
+        .Help => { }
+        .Add { title, tags, priority, due } => {
+            let id = b.add(title.view(), tags, priority, due: due, created: today);
+            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            say_task(&mut sys.stdout, verb: "Qo'shildi:", id);
+        }
+        .Show { filter, format } => {
+            list_tasks(&mut sys.stdout, &b, filter: &filter, format: format, today: today, a: a);
+        }
+        .Stats => {
+            report.stats(&mut sys.stdout, &b, today: today, a: a);
+        }
+        .Finish { id } => {
+            match b.finish(id, on: today) {
+                ok(_) => { }
+                err(e) => { return board_failure(&mut sys.stderr, e, id: id); }
+            }
+            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            say_task(&mut sys.stdout, verb: "Bajarildi:", id);
+        }
+        .Reopen { id } => {
+            match b.reopen(id) {
+                ok(_) => { }
+                err(e) => { return board_failure(&mut sys.stderr, e, id: id); }
+            }
+            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            say_task(&mut sys.stdout, verb: "Qayta ochildi:", id);
+        }
+        .Remove { id } => {
+            match b.remove(id) {
+                ok(_) => { }
+                err(e) => { return board_failure(&mut sys.stderr, e, id: id); }
+            }
+            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            say_task(&mut sys.stdout, verb: "O'chirildi:", id);
+        }
+    }
+}
+
+fn needs_board(command: &cli.Command) -> bool {
+    match command {
+        .Help => { return false; }
+        _ => { return true; }
+    }
+}
+
+fn run(sys: &mut std.System) -> Failed!void {
+    let a = sys.alloc;
+    var words = alloc.List(alloc.String).init(a);
+    var i: usize = 1;
+    while i < sys.args.len() : (i += 1) {
+        words.push(board.copy_text(sys.args.get(i), a));
+    }
+    var path = sys.env.get("VAZIFA_FAYL", a) orelse board.copy_text(DEFAULT_FILE, a);
+    var rest = alloc.List(alloc.String).init(a);
+    match cli.take_file_option(words.items(), path: &mut path, a: a) {
+        ok(r) => { rest = r; }
+        err(e) => {
+            say_error(&mut sys.stderr, cli.explain(e));
+            return Failed.Usage;
+        }
+    }
+    match cli.parse(rest.items(), a) {
+        ok(command) => { try run_command(sys, command, path: path.view(), a: a); }
+        err(e) => {
+            say_error(&mut sys.stderr, cli.explain(e));
+            sys.stderr.write("Yordam: vazifa yordam\n");
+            return Failed.Usage;
+        }
+    }
+}
+
+fn main(sys: &mut std.System) -> !void {
+    match run(sys) {
+        ok(_) => { }
+        // Each has said what went wrong: the program only has to end so.
+        err(.Usage) => { sys.proc.exit(2); }
+        err(_) => { sys.proc.exit(1); }
+    }
+}
