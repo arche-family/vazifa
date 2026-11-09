@@ -6,5 +6,5 @@ const PACKAGE: build.Package = build.Package {
     name: "vazifa",
     version: "0.1.0",
     edition: 2026,
-    needs: [build.Capability.Fs, build.Capability.Clock, build.Capability.Env, build.Capability.Proc],
+    needs: [build.Capability.Fs, build.Capability.Clock, build.Capability.Env, build.Capability.Proc, build.Capability.Rand],
 };

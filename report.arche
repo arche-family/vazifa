@@ -9,28 +9,49 @@ import std.testing as std_testing;
 
 // ---- which tasks --------------------------------------------------------------------
 
-fn lower_ascii(c: u8) -> u8 {
-    if c >= 'A' and c <= 'Z' {
-        return c - 'A' + 'a';
-    }
-    return c;
+/// A character as a search compares it: an ASCII letter in lower case, and
+/// each apostrophe Uzbek is written with, ʻ ’ ‘ ʼ ` and ', as '. Bytes that
+/// are not UTF-8 stand for themselves.
+type Folded = struct {
+    code: u32,
+    len: usize,
 }
 
-/// Whether text is in hay, whatever the case of its ASCII letters.
+fn folded_at(b: []u8, at: usize) -> Folded {
+    let d = utf8.decode(b, at:) orelse utf8.Decoded { code: b[at] as u32, len: 1 };
+    var code = d.code;
+    if code >= 0x41 and code <= 0x5A {
+        code += 32;
+    } else if code == 0x02BB or code == 0x2019 or code == 0x2018 or code == 0x02BC or code == 0x60 {
+        code = 0x27;
+    }
+    return Folded { code: code, len: d.len };
+}
+
+/// Whether text is in hay, as folded_at compares them.
 pub fn contains_text(hay: str, text: str) -> bool {
     let h = hay.bytes();
     let n = text.bytes();
     if n.len() == 0 {
         return true;
     }
-    var at: usize = 0;
-    while at + n.len() <= h.len() : (at += 1) {
+    var start: usize = 0;
+    while start < h.len() {
+        var i = start;
         var k: usize = 0;
-        while k < n.len() and lower_ascii(h[at + k]) == lower_ascii(n[k]) : (k += 1) {
+        while k < n.len() and i < h.len() {
+            let x = folded_at(h, at: i);
+            let y = folded_at(n, at: k);
+            if x.code != y.code {
+                break;
+            }
+            i += x.len;
+            k += y.len;
         }
         if k == n.len() {
             return true;
         }
+        start += folded_at(h, at: start).len;
     }
     return false;
 }
@@ -61,7 +82,7 @@ pub type Report = interface {
 pub fn show(form: &mut dyn Report, out: &mut std.Output, b: &board.Board, places: []u32, today: date.Date) {
     form.begin(out);
     for p in places {
-        form.row(out, &b.tasks[p.* as usize], today: today);
+        form.row(out, &b.tasks[p.* as usize], today:);
     }
     form.end(out);
 }
@@ -140,7 +161,11 @@ impl Report for Table {
     }
 
     fn row(self: &mut Table, out: &mut std.Output, t: &board.Task, today: date.Date) {
-        spaces(out, 5 - width_of(t.id as u64));
+        // Ids up to five digits line up; a longer one pushes its row along.
+        let width = width_of(t.id as u64);
+        if width < 5 {
+            spaces(out, 5 - width);
+        }
         out.write_u64(t.id as u64);
         if t.is_open() {
             out.write(" [ ] ");
@@ -150,7 +175,7 @@ impl Report for Table {
         let name = t.priority.name();
         out.write(name);
         spaces(out, 7 - name.len());
-        write_deadline(out, t, today: today, a: self.a);
+        write_deadline(out, t, today:, a: self.a);
         out.write(" ");
         out.write(t.title.view());
         for tag in t.tags.items() {
@@ -345,11 +370,27 @@ pub fn stats(out: &mut std.Output, b: &board.Board, today: date.Date, a: alloc.A
     write_tags(out, b, a);
 }
 
-test "a text is found whatever its case" {
+test "a text is found whatever its case and its apostrophe" {
     assert(contains_text(hay: "Hisobotni YOZISH", text: "yozish"));
     assert(contains_text(hay: "abc", text: ""));
     assert(not contains_text(hay: "ab", text: "abc"));
     assert(not contains_text(hay: "hisobot", text: "yoz"));
+    assert(contains_text(hay: "Oʻzbekcha matn", text: "o'zbek"));
+    assert(contains_text(hay: "O’zbekcha", text: "Oʻzbek"));
+    assert(contains_text(hay: "gʻisht", text: "G'ISHT"));
+    assert(not contains_text(hay: "ozbek", text: "o'zbek"));
+}
+
+test "a long id does not break the table" (t: &mut std_testing.Test) {
+    let sys = t.system();
+    let a = sys.alloc;
+    var b = board.Board.init(a);
+    let day = date.make(2026, month: 11, day: 6) orelse panic("a date");
+    b.next_id = 1234567;
+    _ = b.add("katta raqam", alloc.List(alloc.String).init(a), board.Priority.Normal, due: none, created: day);
+    var form = Table.init(a);
+    let places: [1]u32 = [0];
+    show(&mut form, out: &mut sys.stdout, &b, places: places[0..1], today: day);
 }
 
 test "a filter says who stays" (t: &mut std_testing.Test) {
@@ -358,21 +399,21 @@ test "a filter says who stays" (t: &mut std_testing.Test) {
     let past = date.make(2026, month: 11, day: 1) orelse panic("a date");
     var b = board.Board.init(a);
     var tags = alloc.List(alloc.String).init(a);
-    tags.push(board.copy_text("ish", a));
-    _ = b.add("Hisobot", tags, board.Priority.High, due: date.lift(past), created: past);
+    tags.push(alloc.String.from("ish", a));
+    _ = b.add("Hisobot", tags, board.Priority.High, due: some(past), created: past);
     let done = b.add("Tayyor", alloc.List(alloc.String).init(a), board.Priority.Low, due: none, created: past);
     b.finish(done, on: today) catch panic("unexpected error");
 
     var f = cli.Filter { show_done: false, only_overdue: false, tag: alloc.String.init(a), text: alloc.String.init(a) };
-    assert(matches(&f, &b.tasks[0], today: today));
-    assert(not matches(&f, &b.tasks[1], today: today));
+    assert(matches(&f, &b.tasks[0], today:));
+    assert(not matches(&f, &b.tasks[1], today:));
     f.show_done = true;
-    assert(matches(&f, &b.tasks[1], today: today));
+    assert(matches(&f, &b.tasks[1], today:));
     f.only_overdue = true;
-    assert(matches(&f, &b.tasks[0], today: today));
-    assert(not matches(&f, &b.tasks[1], today: today));
-    f.tag = board.copy_text("uy", a);
-    assert(not matches(&f, &b.tasks[0], today: today));
+    assert(matches(&f, &b.tasks[0], today:));
+    assert(not matches(&f, &b.tasks[1], today:));
+    f.tag = alloc.String.from("uy", a);
+    assert(not matches(&f, &b.tasks[0], today:));
 }
 
 test "a csv field gets quotes when it needs them" (t: &mut std_testing.Test) {

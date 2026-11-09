@@ -40,7 +40,7 @@ pub type CliError = error {
 pub fn explain(e: CliError) -> str {
     match e {
         .UnknownCommand => { return "bunday buyruq yo'q"; }
-        .UnknownOption => { return "bunday parametr yo'q"; }
+        .UnknownOption => { return "bunday parametr yo'q; '-' bilan boshlanadigan matn '--'dan keyin yoziladi: qosh -- -5 kg"; }
         .MissingValue => { return "parametrning qiymati berilmagan"; }
         .MissingTitle => { return "vazifa matni berilmagan"; }
         .MissingId => { return "vazifa raqami berilmagan"; }
@@ -80,11 +80,21 @@ fn parse_add(words: []alloc.String, a: alloc.Allocator) -> CliError!Command {
     var priority = board.Priority.Normal;
     var due: ?date.Date = none;
     var i: usize = 1;
+    var rest_is_title = false;
     while i < words.len() : (i += 1) {
         let word = words[i].view();
-        if word.eq("--tag") or word.eq("-t") {
+        if rest_is_title or not word.starts_with("-") {
+            // The words of the title need no quotes.
+            if title.len() > 0 {
+                title.push_ascii(' ');
+            }
+            title.push_str(word);
+        } else if word.eq("--") {
+            // What follows is the title, even what starts with '-'.
+            rest_is_title = true;
+        } else if word.eq("--tag") or word.eq("-t") {
             i = try value_after(words, i: i);
-            tags.push(board.copy_text(words[i].view(), a));
+            tags.push(alloc.String.from(words[i].view(), a));
         } else if word.eq("--muhim") or word.eq("-m") {
             i = try value_after(words, i: i);
             match board.Priority.parse(words[i].view()) {
@@ -94,17 +104,11 @@ fn parse_add(words: []alloc.String, a: alloc.Allocator) -> CliError!Command {
         } else if word.eq("--muddat") or word.eq("-d") {
             i = try value_after(words, i: i);
             match date.parse(words[i].view()) {
-                some(d) => { due = date.lift(d); }
+                some(d) => { due = some(d); }
                 none => { return CliError.BadDate; }
             }
-        } else if word.starts_with("-") {
-            return CliError.UnknownOption;
         } else {
-            // The words of the title need no quotes.
-            if title.len() > 0 {
-                title.push_ascii(' ');
-            }
-            title.push_str(word);
+            return CliError.UnknownOption;
         }
     }
     if title.len() == 0 {
@@ -125,10 +129,10 @@ fn parse_list(words: []alloc.String, a: alloc.Allocator) -> CliError!Command {
             filter.only_overdue = true;
         } else if word.eq("--tag") or word.eq("-t") {
             i = try value_after(words, i: i);
-            filter.tag = board.copy_text(words[i].view(), a);
+            filter.tag = alloc.String.from(words[i].view(), a);
         } else if word.eq("--qidir") or word.eq("-q") {
             i = try value_after(words, i: i);
-            filter.text = board.copy_text(words[i].view(), a);
+            filter.text = alloc.String.from(words[i].view(), a);
         } else if word.eq("--format") {
             i = try value_after(words, i: i);
             let name = words[i].view();
@@ -191,9 +195,9 @@ pub fn take_file_option(words: []alloc.String, path: &mut alloc.String, a: alloc
     while i < words.len() : (i += 1) {
         if words[i].view().eq("--fayl") {
             i = try value_after(words, i: i);
-            path.* = board.copy_text(words[i].view(), a);
+            path.* = alloc.String.from(words[i].view(), a);
         } else {
-            rest.push(board.copy_text(words[i].view(), a));
+            rest.push(alloc.String.from(words[i].view(), a));
         }
     }
     return rest;
@@ -206,7 +210,7 @@ fn split_words(line: str, a: alloc.Allocator) -> alloc.List(alloc.String) {
     var i: usize = 0;
     while i <= b.len() : (i += 1) {
         if i == b.len() or b[i] == ' ' {
-            list.push(board.copy_text(line[start..i], a));
+            list.push(alloc.String.from(line[start..i], a));
             start = i + 1;
         }
     }
@@ -225,6 +229,17 @@ test "add takes a title of many words, and its options anywhere" (t: &mut std_te
                 some(d) => { assert(d.day == 1); }
                 none => { panic("no deadline"); }
             }
+        }
+        _ => { panic("not an add"); }
+    }
+}
+
+test "after --, everything is the title" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    match parse(split_words("qosh -m past -- -5 kg kartoshka", a).items(), a) {
+        ok(.Add { title, tags, priority, due }) => {
+            assert(title.view().eq("-5 kg kartoshka"));
+            assert(priority.rank() == 0);
         }
         _ => { panic("not an add"); }
     }

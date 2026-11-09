@@ -1,7 +1,6 @@
 /// Calendar dates, with no time and no zone in them: what a deadline needs.
 import alloc;
 import core;
-import core.fmt;
 import std;
 
 /// Tashkent is UTC+5, all year: what "today" means to this program.
@@ -60,11 +59,6 @@ fn digits(t: []u8) -> ?u32 {
         n = n * 10 + (c.* - '0') as u32;
     }
     return n;
-}
-
-/// The date as an optional one: the language lifts a value only at a return.
-pub fn lift(d: Date) -> ?Date {
-    return d;
 }
 
 /// A date written as YYYY-MM-DD.
@@ -128,16 +122,15 @@ pub fn today(clock: &std.Clock) -> Date {
 }
 
 fn push_padded(out: &mut alloc.String, value: u64, width: usize) {
-    var buf: [20]u8 = [0; 20];
-    let n = fmt.decimal(value, buf[0..20]);
-    var pad = n;
-    while pad < width : (pad += 1) {
+    var count: usize = 1;
+    var left = value;
+    while left >= 10 : (left = left / 10) {
+        count += 1;
+    }
+    while count < width : (count += 1) {
         out.push_ascii('0');
     }
-    var i: usize = 0;
-    while i < n : (i += 1) {
-        out.push_ascii(buf[i]);
-    }
+    out.push_u64(value);
 }
 
 /// As YYYY-MM-DD: what parse reads.
@@ -150,10 +143,10 @@ pub fn write(d: Date, out: &mut alloc.String) {
 }
 
 fn is_date(d: ?Date) -> bool {
-    match d {
-        some(_) => { return true; }
-        none => { return false; }
-    }
+    return match d {
+        some(_) => { true }
+        none => { false }
+    };
 }
 
 test "the calendar knows its leap years" {

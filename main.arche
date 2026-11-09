@@ -20,8 +20,8 @@ type Failed = error { Usage, Saving, NoSuchTask, AlreadyDone, NotDone }
 fn write_help(out: &mut std.Output) {
     out.write("vazifa: vazifalarni terminalda yuritish\n\n");
     out.write("Buyruqlar:\n");
-    out.write("  qosh <matn> [-m past|oddiy|yuqori] [-d YYYY-MM-DD] [-t teg]...\n");
-    out.write("                       yangi vazifa\n");
+    out.write("  qosh <matn> [-m past|oddiy|yuqori] [-d YYYY-MM-DD] [-t teg]... [-- matn]\n");
+    out.write("                       yangi vazifa; '--'dan keyingi hamma so'z matn\n");
     out.write("  royxat [-a] [-t teg] [-q matn] [--kechikkan] [--format table|csv]\n");
     out.write("                       vazifalar: -a bajarilganlari bilan\n");
     out.write("  bajar <raqam>        vazifani bajarilgan deb belgilash\n");
@@ -61,31 +61,35 @@ fn board_failure(err_out: &mut std.Output, e: board.BoardError, id: u32) -> Fail
             err_out.write(" hali bajarilmagan\n");
             return Failed.NotDone;
         }
+        .DuplicateId => {
+            err_out.write(" ikki marta turibdi\n");
+            return Failed.NotDone;
+        }
     }
 }
 
 /// Keeps what a command changed.
-fn save_board(fs: &std.Fs, err_out: &mut std.Output, path: str, b: &board.Board, a: alloc.Allocator) -> Failed!void {
-    match store.save(fs, path: path, b, a) {
+fn save_board(sys: &mut std.System, path: str, b: &board.Board, a: alloc.Allocator) -> Failed!void {
+    match store.save(&sys.fs, rand: &mut sys.rand, file: path, b, a) {
         ok(_) => { }
         err(e) => {
-            say_error(err_out, store.explain(e));
+            say_error(&mut sys.stderr, store.explain(e));
             return Failed.Saving;
         }
     }
 }
 
 fn list_tasks(out: &mut std.Output, b: &board.Board, filter: &cli.Filter, format: cli.Format, today: date.Date, a: alloc.Allocator) {
-    let keep = fn [filter, today](t: &board.Task) -> bool { return report.matches(filter, t, today: today); };
+    let keep = fn [filter, today](t: &board.Task) -> bool { return report.matches(filter, t, today:); };
     let places = b.select(&keep, a);
     match format {
         .Table => {
             var form = report.Table.init(a);
-            report.show(&mut form, out: out, b, places: places.items(), today: today);
+            report.show(&mut form, out: out, b, places: places.items(), today:);
         }
         .Csv => {
             var form = report.Csv.init(a);
-            report.show(&mut form, out: out, b, places: places.items(), today: today);
+            report.show(&mut form, out: out, b, places: places.items(), today:);
         }
     }
 }
@@ -96,50 +100,49 @@ fn run_command(sys: &mut std.System, command: cli.Command, path: str, a: alloc.A
         write_help(&mut sys.stdout);
         return;
     }
-    var b = board.Board.init(a);
-    match store.load(&sys.fs, path: path, a) {
-        ok(loaded) => { b = loaded; }
+    var b = match store.load(&sys.fs, file: path, a) {
+        ok(loaded) => { loaded }
         err(e) => {
             say_error(&mut sys.stderr, store.explain(e));
             return Failed.Saving;
         }
-    }
+    };
     let today = date.today(&sys.clock);
     match command {
         .Help => { }
         .Add { title, tags, priority, due } => {
-            let id = b.add(title.view(), tags, priority, due: due, created: today);
-            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            let id = b.add(title.view(), tags, priority, due:, created: today);
+            try save_board(sys, path:, &b, a);
             say_task(&mut sys.stdout, verb: "Qo'shildi:", id);
         }
         .Show { filter, format } => {
-            list_tasks(&mut sys.stdout, &b, filter: &filter, format: format, today: today, a: a);
+            list_tasks(&mut sys.stdout, &b, filter: &filter, format: format, today:, a:);
         }
         .Stats => {
-            report.stats(&mut sys.stdout, &b, today: today, a: a);
+            report.stats(&mut sys.stdout, &b, today:, a:);
         }
         .Finish { id } => {
             match b.finish(id, on: today) {
                 ok(_) => { }
-                err(e) => { return board_failure(&mut sys.stderr, e, id: id); }
+                err(e) => { return board_failure(&mut sys.stderr, e, id:); }
             }
-            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            try save_board(sys, path:, &b, a);
             say_task(&mut sys.stdout, verb: "Bajarildi:", id);
         }
         .Reopen { id } => {
             match b.reopen(id) {
                 ok(_) => { }
-                err(e) => { return board_failure(&mut sys.stderr, e, id: id); }
+                err(e) => { return board_failure(&mut sys.stderr, e, id:); }
             }
-            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            try save_board(sys, path:, &b, a);
             say_task(&mut sys.stdout, verb: "Qayta ochildi:", id);
         }
         .Remove { id } => {
             match b.remove(id) {
                 ok(_) => { }
-                err(e) => { return board_failure(&mut sys.stderr, e, id: id); }
+                err(e) => { return board_failure(&mut sys.stderr, e, id:); }
             }
-            try save_board(&sys.fs, err_out: &mut sys.stderr, path: path, &b, a);
+            try save_board(sys, path:, &b, a);
             say_task(&mut sys.stdout, verb: "O'chirildi:", id);
         }
     }
@@ -157,19 +160,18 @@ fn run(sys: &mut std.System) -> Failed!void {
     var words = alloc.List(alloc.String).init(a);
     var i: usize = 1;
     while i < sys.args.len() : (i += 1) {
-        words.push(board.copy_text(sys.args.get(i), a));
+        words.push(alloc.String.from(sys.args.get(i), a));
     }
-    var path = sys.env.get("VAZIFA_FAYL", a) orelse board.copy_text(DEFAULT_FILE, a);
-    var rest = alloc.List(alloc.String).init(a);
-    match cli.take_file_option(words.items(), path: &mut path, a: a) {
-        ok(r) => { rest = r; }
+    var path = sys.env.get("VAZIFA_FAYL", a) orelse alloc.String.from(DEFAULT_FILE, a);
+    let rest = match cli.take_file_option(words.items(), path: &mut path, a:) {
+        ok(r) => { r }
         err(e) => {
             say_error(&mut sys.stderr, cli.explain(e));
             return Failed.Usage;
         }
-    }
+    };
     match cli.parse(rest.items(), a) {
-        ok(command) => { try run_command(sys, command, path: path.view(), a: a); }
+        ok(command) => { try run_command(sys, command, path: path.view(), a:); }
         err(e) => {
             say_error(&mut sys.stderr, cli.explain(e));
             sys.stderr.write("Yordam: vazifa yordam\n");

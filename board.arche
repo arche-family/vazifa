@@ -59,17 +59,17 @@ pub type Task = struct {
     pub status: Status,
 
     pub fn is_open(self: &Task) -> bool {
-        match self.status {
-            .Open => { return true; }
-            _ => { return false; }
-        }
+        return match self.status {
+            .Open => { true }
+            _ => { false }
+        };
     }
 
     pub fn is_removed(self: &Task) -> bool {
-        match self.status {
-            .Removed => { return true; }
-            _ => { return false; }
-        }
+        return match self.status {
+            .Removed => { true }
+            _ => { false }
+        };
     }
 
     /// Open, with its deadline before this day.
@@ -90,7 +90,7 @@ pub type Task = struct {
     }
 }
 
-pub type BoardError = error { NoSuchTask, AlreadyDone, NotDone }
+pub type BoardError = error { NoSuchTask, AlreadyDone, NotDone, DuplicateId }
 
 /// How tasks are ordered in a list: open ones first, then the more important,
 /// then the sooner due, with no deadline last, then the older.
@@ -128,12 +128,6 @@ fn rank_of(t: &Task, place: usize) -> Rank {
     return Rank { closed: not t.is_open(), urgency: t.priority.rank(), due_days: due_days, id: t.id, place: place as u32 };
 }
 
-pub fn copy_text(text: str, a: alloc.Allocator) -> alloc.String {
-    var s = alloc.String.init(a);
-    s.push_str(text);
-    return s;
-}
-
 pub type Board = struct {
     pub tasks: alloc.List(Task),
     pub next_id: u32,
@@ -147,12 +141,17 @@ pub type Board = struct {
     pub fn add(self: &mut Board, title: str, tags: alloc.List(alloc.String), priority: Priority, due: ?date.Date, created: date.Date) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        self.tasks.push(Task { id: id, title: copy_text(title, self.a), tags: tags, priority: priority, created: created, due: due, status: Status.Open });
+        self.tasks.push(Task { id: id, title: alloc.String.from(title, self.a), tags: tags, priority: priority, created: created, due: due, status: Status.Open });
         return id;
     }
 
-    /// A task as it was saved.
-    pub fn restore(self: &mut Board, t: Task) {
+    /// A task as it was saved. Two with one id would make an id name either.
+    pub fn restore(self: &mut Board, t: Task) -> BoardError!void {
+        for other in self.tasks.items() {
+            if other.id == t.id {
+                return BoardError.DuplicateId;
+            }
+        }
         if t.id >= self.next_id {
             self.next_id = t.id + 1;
         }
@@ -264,11 +263,11 @@ test "a task is finished once, and can be reopened" (t: &mut std_testing.Test) {
 test "a list puts first what matters most" (t: &mut std_testing.Test) {
     let a = t.system().alloc;
     var b = Board.init(a);
-    let later = b.add("keyin", no_tags(a), Priority.Normal, due: date.lift(some_day(20)), created: some_day(1));
-    let sooner = b.add("tezroq", no_tags(a), Priority.Normal, due: date.lift(some_day(10)), created: some_day(1));
+    let later = b.add("keyin", no_tags(a), Priority.Normal, due: some(some_day(20)), created: some_day(1));
+    let sooner = b.add("tezroq", no_tags(a), Priority.Normal, due: some(some_day(10)), created: some_day(1));
     let urgent = b.add("shoshilinch", no_tags(a), Priority.High, due: none, created: some_day(1));
     let whenever = b.add("bir kun", no_tags(a), Priority.Normal, due: none, created: some_day(1));
-    let done = b.add("tayyor", no_tags(a), Priority.High, due: date.lift(some_day(2)), created: some_day(1));
+    let done = b.add("tayyor", no_tags(a), Priority.High, due: some(some_day(2)), created: some_day(1));
     b.finish(done, on: some_day(2)) catch panic("unexpected error");
     let all = fn [](x: &Task) -> bool { return true; };
     let order = b.select(&all, a);
@@ -289,7 +288,7 @@ test "count_where works on any items" {
 test "overdue means open and past its day" (t: &mut std_testing.Test) {
     let a = t.system().alloc;
     var b = Board.init(a);
-    let id = b.add("bir", no_tags(a), Priority.Low, due: date.lift(some_day(5)), created: some_day(1));
+    let id = b.add("bir", no_tags(a), Priority.Low, due: some(some_day(5)), created: some_day(1));
     assert(not b.tasks[0].is_overdue(some_day(5)));
     assert(b.tasks[0].is_overdue(some_day(6)));
     b.finish(id, on: some_day(7)) catch panic("unexpected error");

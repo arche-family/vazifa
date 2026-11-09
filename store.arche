@@ -1,47 +1,41 @@
-/// The tasks in a file, as JSON. Writing goes through a second file and a
-/// rename, so that a crash cannot leave half of one.
+/// The tasks in a file, as JSON. A save writes a new file under a name of its
+/// own, syncs it, renames it into place and syncs the directory: neither a
+/// crash nor a power cut leaves half a file, and two runs at once do not write
+/// into one file.
 import alloc;
 import board;
-import core.fmt;
 import date;
 import std;
 import std.json;
+import std.path;
 import std.testing as std_testing;
 
-pub type StoreError = error { CannotRead, CannotWrite, BadFormat }
+pub type StoreError = error { CannotRead, CannotWrite, BadFormat, DuplicateId }
 
 pub fn explain(e: StoreError) -> str {
     match e {
         .CannotRead => { return "vazifalar faylini o'qib bo'lmadi"; }
         .CannotWrite => { return "vazifalar faylini yozib bo'lmadi"; }
         .BadFormat => { return "vazifalar fayli buzilgan"; }
+        .DuplicateId => { return "vazifalar faylida bir raqam ikki vazifada turibdi"; }
     }
 }
 
 // ---- writing ------------------------------------------------------------------------
 
-fn push_number(out: &mut alloc.String, n: u64) {
-    var buf: [20]u8 = [0; 20];
-    let size = fmt.decimal(n, buf[0..20]);
-    var i: usize = 0;
-    while i < size : (i += 1) {
-        out.push_ascii(buf[i]);
-    }
-}
-
 fn push_date_field(out: &mut alloc.String, key: str, d: date.Date) {
     out.push_str(", \"");
     out.push_str(key);
     out.push_str("\": \"");
-    date.write(d, out: out);
+    date.write(d, out:);
     out.push_str("\"");
 }
 
 fn push_task(out: &mut alloc.String, t: &board.Task) {
     out.push_str("    {\"id\": ");
-    push_number(out, t.id as u64);
+    out.push_u64(t.id as u64);
     out.push_str(", \"title\": ");
-    json.write_string(t.title.view(), out: out);
+    json.write_string(t.title.view(), out:);
     out.push_str(", \"priority\": \"");
     out.push_str(t.priority.name());
     out.push_str("\", \"tags\": [");
@@ -50,7 +44,7 @@ fn push_task(out: &mut alloc.String, t: &board.Task) {
         if i > 0 {
             out.push_str(", ");
         }
-        json.write_string(tag.view(), out: out);
+        json.write_string(tag.view(), out:);
         i += 1;
     }
     out.push_str("]");
@@ -69,9 +63,8 @@ fn push_task(out: &mut alloc.String, t: &board.Task) {
 /// The board as text. A removed task is left out: its id is not reused, because
 /// next_id is kept.
 pub fn encode(b: &board.Board, a: alloc.Allocator) -> alloc.String {
-    var out = alloc.String.init(a);
-    out.push_str("{\n  \"next_id\": ");
-    push_number(&mut out, b.next_id as u64);
+    var out = alloc.String.from("{\n  \"next_id\": ", a);
+    out.push_u64(b.next_id as u64);
     out.push_str(",\n  \"tasks\": [\n");
     var first = true;
     for t in b.tasks.items() {
@@ -88,18 +81,40 @@ pub fn encode(b: &board.Board, a: alloc.Allocator) -> alloc.String {
     return out;
 }
 
-pub fn save(fs: &std.Fs, path: str, b: &board.Board, a: alloc.Allocator) -> StoreError!void {
+const HEX: str = "0123456789abcdef";
+
+/// A name beside the file for the new one, by chance, so that two runs at once
+/// write two files.
+fn temporary_name(file: str, rand: &mut std.Rand, a: alloc.Allocator) -> alloc.String {
+    var name = alloc.String.from(file, a);
+    name.push_ascii('.');
+    let r = rand.next_u64();
+    var shift: u64 = 64;
+    while shift > 0 {
+        shift -= 4;
+        name.push_ascii(HEX.bytes()[((r >> shift) & 15) as usize]);
+    }
+    name.push_str(".tmp");
+    return name;
+}
+
+pub fn save(fs: &std.Fs, rand: &mut std.Rand, file: str, b: &board.Board, a: alloc.Allocator) -> StoreError!void {
     let text = encode(b, a);
-    var temporary = board.copy_text(path, a);
-    temporary.push_str(".tmp");
-    match fs.write_file(path: temporary.view(), data: text.view()) {
+    let temporary = temporary_name(file, rand:, a:);
+    fs.write_file(path: temporary.view(), data: text.view()) catch return StoreError.CannotWrite;
+    fs.sync(temporary.view()) catch return StoreError.CannotWrite;
+    match fs.rename(from: temporary.view(), to: file) {
         ok(_) => { }
-        err(_) => { return StoreError.CannotWrite; }
+        err(_) => {
+            _ = fs.remove(temporary.view());
+            return StoreError.CannotWrite;
+        }
     }
-    match fs.rename(from: temporary.view(), to: path) {
-        ok(_) => { }
-        err(_) => { return StoreError.CannotWrite; }
+    var dir = path.parent(file);
+    if dir.len() == 0 {
+        dir = ".";
     }
+    fs.sync(dir) catch return StoreError.CannotWrite;
 }
 
 // ---- reading ------------------------------------------------------------------------
@@ -112,55 +127,40 @@ fn member(v: &json.Value, place: usize) -> &json.Value {
     }
 }
 
-fn place_of(v: &json.Value, key: str) -> StoreError!usize {
-    match json.key_index(v, key) {
-        some(i) => { return i; }
-        none => { return StoreError.BadFormat; }
-    }
+/// The member named key, which the object must have.
+fn field(v: &json.Value, key: str) -> StoreError!usize {
+    return json.key_index(v, key) orelse return StoreError.BadFormat;
 }
 
 fn copy_of_text(v: &json.Value, a: alloc.Allocator) -> StoreError!alloc.String {
-    match v {
-        .Text { value } => { return board.copy_text(value.view(), a); }
+    return match v {
+        .Text { value } => { alloc.String.from(value.view(), a) }
         _ => { return StoreError.BadFormat; }
-    }
+    };
 }
 
 fn date_of(v: &json.Value) -> StoreError!date.Date {
-    match v {
-        .Text { value } => {
-            match date.parse(value.view()) {
-                some(d) => { return d; }
-                none => { return StoreError.BadFormat; }
-            }
-        }
+    return match v {
+        .Text { value } => { date.parse(value.view()) orelse return StoreError.BadFormat }
         _ => { return StoreError.BadFormat; }
-    }
+    };
 }
 
 fn u32_of(v: &json.Value) -> StoreError!u32 {
-    match json.as_i64(v) {
-        some(n) => {
-            if n < 0 or n > 4294967295 {
-                return StoreError.BadFormat;
-            }
-            return n as u32;
-        }
-        none => { return StoreError.BadFormat; }
+    let n = json.as_i64(v) orelse return StoreError.BadFormat;
+    if n < 0 or n > 4294967295 {
+        return StoreError.BadFormat;
     }
+    return n as u32;
 }
 
 fn read_task(v: &json.Value, a: alloc.Allocator) -> StoreError!board.Task {
-    let id = try u32_of(member(v, place: try place_of(v, key: "id")));
-    let title = try copy_of_text(member(v, place: try place_of(v, key: "title")), a);
-    let priority_name = try copy_of_text(member(v, place: try place_of(v, key: "priority")), a);
-    var priority = board.Priority.Normal;
-    match board.Priority.parse(priority_name.view()) {
-        some(p) => { priority = p; }
-        none => { return StoreError.BadFormat; }
-    }
+    let id = try u32_of(member(v, place: try field(v, key: "id")));
+    let title = try copy_of_text(member(v, place: try field(v, key: "title")), a);
+    let priority_name = try copy_of_text(member(v, place: try field(v, key: "priority")), a);
+    let priority = board.Priority.parse(priority_name.view()) orelse return StoreError.BadFormat;
     var tags = alloc.List(alloc.String).init(a);
-    match member(v, place: try place_of(v, key: "tags")) {
+    match member(v, place: try field(v, key: "tags")) {
         .Array { items } => {
             for item in items.items() {
                 tags.push(try copy_of_text(item, a));
@@ -168,10 +168,10 @@ fn read_task(v: &json.Value, a: alloc.Allocator) -> StoreError!board.Task {
         }
         _ => { return StoreError.BadFormat; }
     }
-    let created = try date_of(member(v, place: try place_of(v, key: "created")));
+    let created = try date_of(member(v, place: try field(v, key: "created")));
     var due: ?date.Date = none;
     match json.key_index(v, "due") {
-        some(i) => { due = date.lift(try date_of(member(v, place: i))); }
+        some(i) => { due = some(try date_of(member(v, place: i))); }
         none => { }
     }
     var status = board.Status.Open;
@@ -184,21 +184,17 @@ fn read_task(v: &json.Value, a: alloc.Allocator) -> StoreError!board.Task {
 
 /// The board in this text.
 pub fn decode(text: str, a: alloc.Allocator) -> StoreError!board.Board {
-    var parsed = json.Value.Null;
-    match json.parse(text, a) {
-        ok(v) => { parsed = v; }
-        err(_) => { return StoreError.BadFormat; }
-    }
+    let parsed = json.parse(text, a) catch return StoreError.BadFormat;
     var b = board.Board.init(a);
-    match member(&parsed, place: try place_of(&parsed, key: "tasks")) {
+    match member(&parsed, place: try field(&parsed, key: "tasks")) {
         .Array { items } => {
             for item in items.items() {
-                b.restore(try read_task(item, a));
+                b.restore(try read_task(item, a)) catch return StoreError.DuplicateId;
             }
         }
         _ => { return StoreError.BadFormat; }
     }
-    let next = try u32_of(member(&parsed, place: try place_of(&parsed, key: "next_id")));
+    let next = try u32_of(member(&parsed, place: try field(&parsed, key: "next_id")));
     if next > b.next_id {
         b.next_id = next;
     }
@@ -206,14 +202,12 @@ pub fn decode(text: str, a: alloc.Allocator) -> StoreError!board.Board {
 }
 
 /// The board in the file; an empty one if there is no such file yet.
-pub fn load(fs: &std.Fs, path: str, a: alloc.Allocator) -> StoreError!board.Board {
-    if not fs.exists(path) {
+pub fn load(fs: &std.Fs, file: str, a: alloc.Allocator) -> StoreError!board.Board {
+    if not fs.exists(file) {
         return board.Board.init(a);
     }
-    match fs.read_file(path, a) {
-        ok(text) => { return try decode(text.view(), a); }
-        err(_) => { return StoreError.CannotRead; }
-    }
+    let text = fs.read_file(file, a) catch return StoreError.CannotRead;
+    return try decode(text.view(), a);
 }
 
 fn day(n: u8) -> date.Date {
@@ -224,9 +218,9 @@ test "what is saved reads back the same" (t: &mut std_testing.Test) {
     let a = t.system().alloc;
     var b = board.Board.init(a);
     var tags = alloc.List(alloc.String).init(a);
-    tags.push(board.copy_text("ish", a));
-    tags.push(board.copy_text("\"muhim\" yangi\nqator", a));
-    let first = b.add("Hisobot: \"oy yakuni\"", tags, board.Priority.High, due: date.lift(day(20)), created: day(1));
+    tags.push(alloc.String.from("ish", a));
+    tags.push(alloc.String.from("\"muhim\" yangi\nqator", a));
+    let first = b.add("Hisobot: \"oy yakuni\"", tags, board.Priority.High, due: some(day(20)), created: day(1));
     let second = b.add("Ikkinchi", alloc.List(alloc.String).init(a), board.Priority.Low, due: none, created: day(2));
     let third = b.add("O'chiriladi", alloc.List(alloc.String).init(a), board.Priority.Normal, due: none, created: day(2));
     b.finish(second, on: day(3)) catch panic("unexpected error");
@@ -261,4 +255,24 @@ test "a broken file is said to be so" (t: &mut std_testing.Test) {
         err(.BadFormat) => { }
         _ => { panic("a list was read"); }
     }
+}
+
+test "two tasks with one id are refused" (t: &mut std_testing.Test) {
+    let a = t.system().alloc;
+    var text = alloc.String.from("{\"next_id\": 3, \"tasks\": [", a);
+    text.push_str("{\"id\": 1, \"title\": \"a\", \"priority\": \"past\", \"tags\": [], \"created\": \"2026-11-06\"}, ");
+    text.push_str("{\"id\": 1, \"title\": \"b\", \"priority\": \"yuqori\", \"tags\": [], \"created\": \"2026-11-06\"}]}");
+    match decode(text.view(), a) {
+        err(.DuplicateId) => { }
+        _ => { panic("the same id was read twice"); }
+    }
+}
+
+test "a save names its file by chance, beside the file" (t: &mut std_testing.Test) {
+    let sys = t.system();
+    let one = temporary_name("data/v.json", rand: &mut sys.rand, a: sys.alloc);
+    let two = temporary_name("data/v.json", rand: &mut sys.rand, a: sys.alloc);
+    assert(one.view().starts_with("data/v.json."));
+    assert(one.len() == "data/v.json.".len() + 16 + 4);
+    assert(not one.view().eq(two.view()));
 }
